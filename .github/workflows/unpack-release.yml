@@ -5,7 +5,8 @@ on:
       asset_name:
         description: 'Имя файла из Releases (например: deep-resolver.tar.gz)'
         required: false
-        default: ''
+        default: 'deep-resolver.tar.gz'
+
 permissions:
   contents: write
 
@@ -13,79 +14,108 @@ jobs:
   unpack:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout (with creds)
         uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
+        with:
+          fetch-depth: 0
+          persist-credentials: true
 
       - name: Install tools
         run: |
           set -euxo pipefail
           sudo apt-get update -y
-          sudo apt-get install -y jq unzip p7zip-full
+          sudo apt-get install -y jq unzip p7zip-full rsync
 
-      - name: Pick asset from latest release
+      - name: Pick & download latest release asset
         id: pick
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euxo pipefail
           API="https://api.github.com/repos/${{ github.repository }}/releases/latest"
+          NAME="${{ github.event.inputs.asset_name }}"
           JSON="$(curl -fsSL -H "authorization: Bearer $GH_TOKEN" "$API")"
 
-          INPUT="${{ github.event.inputs.asset_name }}"
-          if [ -n "$INPUT" ]; then
-            URL=$(echo "$JSON" | jq -r --arg n "$INPUT" '.assets[] | select(.name==$n) | .browser_download_url')
+          if [ -n "$NAME" ]; then
+            URL=$(echo "$JSON" | jq -r --arg n "$NAME" '.assets[] | select(.name==$n) | .browser_download_url')
           else
-            # Сначала пробуем tar.gz/tgz, потом zip; иначе — первый ассет
-            URL=$(echo "$JSON" | jq -r '.assets[] | select(.name|test("\\.(tar\\.gz|tgz)$")) | .browser_download_url' | head -n1)
-            if [ -z "$URL" ] || [ "$URL" = "null" ]; then
-              URL=$(echo "$JSON" | jq -r '.assets[] | select(.name|test("\\.zip$")) | .browser_download_url' | head -n1)
-            fi
-            if [ -z "$URL" ] || [ "$URL" = "null" ]; then
-              URL=$(echo "$JSON" | jq -r '.assets[0].browser_download_url')
-            fi
+            URL=$(echo "$JSON" | jq -r '.assets[0].browser_download_url')
           fi
+          [ -n "$URL" ] && [ "$URL" != "null" ]
 
-          test -n "$URL"
-          echo "url=$URL" >> "$GITHUB_OUTPUT"
-          echo "name=$(basename "$URL")" >> "$GITHUB_OUTPUT"
-
-      - name: Download asset
-        run: |
-          set -euxo pipefail
           mkdir -p _zip
-          curl -fL '${{ steps.pick.outputs.url }}' -o _zip/'${{ steps.pick.outputs.name }}'
+          FILE="_zip/$(basename "$URL")"
+          curl -fL "$URL" -o "$FILE"
+
+          echo "file=$FILE"   >> $GITHUB_OUTPUT
+          echo "name=$(basename "$FILE")" >> $GITHUB_OUTPUT
           ls -lh _zip
 
-      - name: Unpack into project/
+      - name: Unpack and CLEAN
         run: |
           set -euxo pipefail
-          FILE="_zip/${{ steps.pick.outputs.name }}"
-          rm -rf project && mkdir -p project
+          FILE='${{ steps.pick.outputs.file }}'
+          rm -rf _unpacked project
+          mkdir -p _unpacked
 
           case "$FILE" in
-            *.tar.gz|*.tgz) tar -xzf "$FILE" -C project ;;
-            *.zip)          unzip -q "$FILE" -d project ;;
-            *)              7z x "$FILE" -oproject ;;
+            *.tar.gz|*.tgz) tar -xzf "$FILE" -C _unpacked ;;
+            *.zip)          unzip -q "$FILE" -d _unpacked ;;
+            *)              7z x "$FILE" -o_unpacked ;;
           esac
 
-          # расплющить одну верхнюю папку, если она есть
-          cd project
-          DCOUNT=$(find . -maxdepth 1 -type d | wc -l)
+          # расплющить единственную верхнюю папку
+          cd _unpacked
+          DCOUNT=$(find . -maxdepth 1 -type d | wc -l || true)
           if [ "$DCOUNT" -eq 2 ]; then
             TOP=$(find . -maxdepth 1 -type d ! -name '.' | head -n1)
             shopt -s dotglob nullglob
             mv "$TOP"/* ./
             rmdir "$TOP" || true
           fi
-          echo "Unpacked tree top-level:"
-          find . -maxdepth 2 -mindepth 1 -print | sed 's/^/ - /'
 
-      - name: Commit unpacked tree
+          # удалить секреты/тяжёлые кеши
+          find . -maxdepth 3 -type f -name ".env*" -delete || true
+          rm -rf .puppeteer-cache node_modules dist build _zip .git || true
+
+          cd ..
+          mkdir -p project
+          rsync -a --delete _unpacked/ project/
+
+          # .gitignore в корне, чтобы мусор не попадал в коммиты
+          cat > .gitignore <<'EOF'
+_zip/
+_unpacked/
+project/.puppeteer-cache/
+project/node_modules/
+project/dist/
+project/build/
+.env
+.env.*
+project/.env
+project/.env.*
+*.log
+*.sqlite
+*.db
+EOF
+
+      - name: Commit & PUSH to main (with diagnostics)
+        env:
+          BRANCH: main
         run: |
           set -euxo pipefail
+          git status
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # убедимся, что есть origin и нужная ветка
+          git remote -v
+          git branch -a
+
           git add -A
           git commit -m "Unpacked latest release asset into project/ [skip ci]" || echo "Nothing to commit"
-          git push
+          # Явно пушим в main
+          git push origin HEAD:${BRANCH}
+
+          echo "HEAD=$(git rev-parse HEAD)"
+          echo "Branch=${BRANCH}"
