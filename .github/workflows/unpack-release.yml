@@ -1,1 +1,72 @@
-workflow
+name: Unpack release asset into project/
+on:
+  workflow_dispatch:
+    inputs:
+      asset_name:
+        description: 'Имя файла в релизе (например, deep-resolver.tar.gz)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  unpack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: Ensure tools (jq, 7zip)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq p7zip-full
+
+      - name: Get latest release asset URL
+        id: asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          API="https://api.github.com/repos/${{ github.repository }}/releases/latest"
+          NAME="${{ github.event.inputs.asset_name }}"
+          JSON=$(curl -sSL -H "authorization: Bearer $GH_TOKEN" "$API")
+          if [ -n "$NAME" ]; then
+            URL=$(echo "$JSON" | jq -r --arg n "$NAME" '.assets[] | select(.name==$n) | .browser_download_url')
+          else
+            URL=$(echo "$JSON" | jq -r '.assets[0].browser_download_url')
+          fi
+          [ -n "$URL" ] || { echo "В последнем релизе нет подходящего ассета"; exit 1; }
+          echo "url=$URL" >> $GITHUB_OUTPUT
+
+      - name: Download asset
+        run: |
+          mkdir -p _zip
+          curl -fL '${{ steps.asset.outputs.url }}' -o _zip/asset
+
+      - name: Unpack into project/
+        run: |
+          set -e
+          rm -rf project && mkdir project
+          FILE=_zip/asset
+          # пробуем tar.gz, затем zip/7z
+          tar -xzf "$FILE" -C project 2>/dev/null || true
+          if [ -z "$(ls -A project)" ]; then
+            unzip -q "$FILE" -d project 2>/dev/null || 7z x "$FILE" -oproject
+          fi
+          cd project
+          DCOUNT=$(find . -maxdepth 1 -type d | wc -l)
+          if [ "$DCOUNT" -eq 2 ]; then
+            TOP=$(find . -maxdepth 1 -type d ! -name '.' | head -n1)
+            shopt -s dotglob nullglob
+            mv "$TOP"/* ./
+            rmdir "$TOP" || true
+          fi
+
+      - name: Commit unpacked tree
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Unpacked latest release asset into project/ [skip ci]" || echo "Nothing to commit"
+          git push
