@@ -3,10 +3,9 @@ on:
   workflow_dispatch:
     inputs:
       asset_name:
-        description: 'Имя файла в релизе (например, deep-resolver.tar.gz)'
+        description: 'Имя файла из Releases (например: deep-resolver.tar.gz)'
         required: false
         default: ''
-
 permissions:
   contents: write
 
@@ -14,46 +13,63 @@ jobs:
   unpack:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with: { fetch-depth: 0 }
 
-      - name: Ensure tools (jq, 7zip)
+      - name: Install tools
         run: |
+          set -euxo pipefail
           sudo apt-get update -y
-          sudo apt-get install -y jq p7zip-full
+          sudo apt-get install -y jq unzip p7zip-full
 
-      - name: Get latest release asset URL
-        id: asset
+      - name: Pick asset from latest release
+        id: pick
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -e
+          set -euxo pipefail
           API="https://api.github.com/repos/${{ github.repository }}/releases/latest"
-          NAME="${{ github.event.inputs.asset_name }}"
-          JSON=$(curl -sSL -H "authorization: Bearer $GH_TOKEN" "$API")
-          if [ -n "$NAME" ]; then
-            URL=$(echo "$JSON" | jq -r --arg n "$NAME" '.assets[] | select(.name==$n) | .browser_download_url')
+          JSON="$(curl -fsSL -H "authorization: Bearer $GH_TOKEN" "$API")"
+
+          INPUT="${{ github.event.inputs.asset_name }}"
+          if [ -n "$INPUT" ]; then
+            URL=$(echo "$JSON" | jq -r --arg n "$INPUT" '.assets[] | select(.name==$n) | .browser_download_url')
           else
-            URL=$(echo "$JSON" | jq -r '.assets[0].browser_download_url')
+            # Сначала пробуем tar.gz/tgz, потом zip; иначе — первый ассет
+            URL=$(echo "$JSON" | jq -r '.assets[] | select(.name|test("\\.(tar\\.gz|tgz)$")) | .browser_download_url' | head -n1)
+            if [ -z "$URL" ] || [ "$URL" = "null" ]; then
+              URL=$(echo "$JSON" | jq -r '.assets[] | select(.name|test("\\.zip$")) | .browser_download_url' | head -n1)
+            fi
+            if [ -z "$URL" ] || [ "$URL" = "null" ]; then
+              URL=$(echo "$JSON" | jq -r '.assets[0].browser_download_url')
+            fi
           fi
-          [ -n "$URL" ] || { echo "В последнем релизе нет подходящего ассета"; exit 1; }
-          echo "url=$URL" >> $GITHUB_OUTPUT
+
+          test -n "$URL"
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename "$URL")" >> "$GITHUB_OUTPUT"
 
       - name: Download asset
         run: |
+          set -euxo pipefail
           mkdir -p _zip
-          curl -fL '${{ steps.asset.outputs.url }}' -o _zip/asset
+          curl -fL '${{ steps.pick.outputs.url }}' -o _zip/'${{ steps.pick.outputs.name }}'
+          ls -lh _zip
 
       - name: Unpack into project/
         run: |
-          set -e
-          rm -rf project && mkdir project
-          FILE=_zip/asset
-          # пробуем tar.gz, затем zip/7z
-          tar -xzf "$FILE" -C project 2>/dev/null || true
-          if [ -z "$(ls -A project)" ]; then
-            unzip -q "$FILE" -d project 2>/dev/null || 7z x "$FILE" -oproject
-          fi
+          set -euxo pipefail
+          FILE="_zip/${{ steps.pick.outputs.name }}"
+          rm -rf project && mkdir -p project
+
+          case "$FILE" in
+            *.tar.gz|*.tgz) tar -xzf "$FILE" -C project ;;
+            *.zip)          unzip -q "$FILE" -d project ;;
+            *)              7z x "$FILE" -oproject ;;
+          esac
+
+          # расплющить одну верхнюю папку, если она есть
           cd project
           DCOUNT=$(find . -maxdepth 1 -type d | wc -l)
           if [ "$DCOUNT" -eq 2 ]; then
@@ -62,9 +78,12 @@ jobs:
             mv "$TOP"/* ./
             rmdir "$TOP" || true
           fi
+          echo "Unpacked tree top-level:"
+          find . -maxdepth 2 -mindepth 1 -print | sed 's/^/ - /'
 
       - name: Commit unpacked tree
         run: |
+          set -euxo pipefail
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
